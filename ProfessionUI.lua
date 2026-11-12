@@ -921,6 +921,18 @@ end
 
 local ungroupApplying = false
 local ungroupQueued = false
+-- OpenRecipe rebuilds the recipe list via ProcessOpenRecipeResponse → SetDataProvider.
+-- Without this guard, InstallFlatProvider → OpenRecipe → ApplyUngroup → InstallFlatProvider
+-- recurses until TreeListDataProvider:GetLinearized hits a C stack overflow (esp. with
+-- Profitable only, where the flat set and the fresh grouped tree disagree on membership).
+local restoringSelection = false
+
+local function IsProfitableKeep(recipeID)
+	if not CP.settings.profitableOnly then return true end
+	local net = UI:GetNet(recipeID)
+	-- Same rule as ApplyFilter: nil (unknown price) stays; only known losses drop.
+	return net == nil or net >= 0
+end
 
 local function CollectRecipeInfos(dataProvider)
 	local seen = {}
@@ -938,7 +950,11 @@ local function CollectRecipeInfos(dataProvider)
 		end
 	end
 	local list = {}
-	for _, info in pairs(seen) do list[#list + 1] = info end
+	for _, info in pairs(seen) do
+		if IsProfitableKeep(info.recipeID) then
+			list[#list + 1] = info
+		end
+	end
 	table.sort(list, function(a, b)
 		local pa, pb = UI:GetNet(a.recipeID), UI:GetNet(b.recipeID)
 		if pa ~= pb then
@@ -976,7 +992,8 @@ end
 
 local function BuildFlatProvider(sourceProvider)
 	if type(CreateTreeDataProvider) ~= "function" or not sourceProvider then return nil, 0 end
-	if CP.settings.profitableOnly then UI:ApplyFilter(sourceProvider) end
+	-- Do not ApplyFilter/Remove on the source tree: that mutates Blizzard's provider mid-flight
+	-- and makes the on-screen flat set disagree with the next grouped rebuild (OpenRecipe loop).
 	local recipes = CollectRecipeInfos(sourceProvider)
 	if #recipes == 0 then return nil, 0 end
 	local flat = CreateTreeDataProvider()
@@ -1001,15 +1018,13 @@ local function CurrentRecipeID()
 	return info and info.recipeID or nil
 end
 
+-- Signature of the flat list we would install from this provider (favorites de-duped,
+-- profitable-only applied in memory). Used so patch-vs-rebuild agrees when both toggles are on.
 local function RecipeSetSignature(dataProvider)
-	if not dataProvider or type(dataProvider.EnumerateEntireRange) ~= "function" then return "" end
+	if not dataProvider then return "" end
 	local ids = {}
-	for _, node in dataProvider:EnumerateEntireRange() do
-		local d = NodeData(node)
-		local info = d and d.recipeInfo
-		if info and info.recipeID and not info.favoritesInstance then
-			ids[#ids + 1] = info.recipeID
-		end
+	for _, info in ipairs(CollectRecipeInfos(dataProvider)) do
+		ids[#ids + 1] = info.recipeID
 	end
 	table.sort(ids)
 	return table.concat(ids, ",")
@@ -1056,8 +1071,27 @@ local function InstallFlatProvider(flat)
 	ungroupApplying = true
 	scrollBox:SetDataProvider(flat)
 	ungroupApplying = false
-	if recipeID and C_TradeSkillUI and C_TradeSkillUI.OpenRecipe then
-		pcall(C_TradeSkillUI.OpenRecipe, recipeID)
+	-- Re-select only when the swap dropped the craft, and never from inside OpenRecipe's own
+	-- SetDataProvider → ApplyUngroup → InstallFlat re-entry (that was the C stack overflow).
+	if recipeID and not restoringSelection and CurrentRecipeID() ~= recipeID
+		and C_TradeSkillUI and C_TradeSkillUI.OpenRecipe then
+		restoringSelection = true
+		local okRestore, errRestore = pcall(function()
+			local okOpen, errOpen = pcall(C_TradeSkillUI.OpenRecipe, recipeID)
+			if not okOpen then error(errOpen) end
+			-- OpenRecipe installs a grouped tree; flatten once more without another OpenRecipe.
+			-- (The SetDataProvider hook may already have done this while restoringSelection was set.)
+			if not CP.settings.ungroupRecipes then return end
+			local grouped = type(scrollBox.GetDataProvider) == "function" and scrollBox:GetDataProvider()
+			if not (grouped and ProviderHasCategories(grouped)) then return end
+			local flatAgain = BuildFlatProvider(grouped)
+			if not flatAgain then return end
+			ungroupApplying = true
+			scrollBox:SetDataProvider(flatAgain)
+			ungroupApplying = false
+		end)
+		restoringSelection = false
+		if not okRestore then CP:Debug("ungroup reselect failed: %s", tostring(errRestore)) end
 	end
 	if scrollPct and type(scrollBox.SetScrollPercentage) == "function" then
 		After(0, function()

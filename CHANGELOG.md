@@ -11,6 +11,8 @@
   profit is negative. Recipes with missing prices stay visible; empty categories are culled from the list.
 - **Ungroup recipes**: Filter menu / options / `/cf ungroup` drops category headers and shows one flat
   list sorted by profit, so the best craft is at the top instead of buried under Everyday Meals / Stamina Food.
+- Fix: Ungroup + Profitable only no longer recurse through `OpenRecipe` → `SetDataProvider` until
+  `TreeListDataProvider` hits a C stack overflow.
 
 ## 0.5.0
 
