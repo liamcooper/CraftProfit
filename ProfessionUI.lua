@@ -994,12 +994,79 @@ local function BuildFlatProvider(sourceProvider)
 	return flat, #recipes
 end
 
+local function CurrentRecipeID()
+	local form = ProfessionsFrame and ProfessionsFrame.CraftingPage and ProfessionsFrame.CraftingPage.SchematicForm
+	if not (form and type(form.GetRecipeInfo) == "function") then return nil end
+	local info = form:GetRecipeInfo()
+	return info and info.recipeID or nil
+end
+
+local function RecipeSetSignature(dataProvider)
+	if not dataProvider or type(dataProvider.EnumerateEntireRange) ~= "function" then return "" end
+	local ids = {}
+	for _, node in dataProvider:EnumerateEntireRange() do
+		local d = NodeData(node)
+		local info = d and d.recipeInfo
+		if info and info.recipeID and not info.favoritesInstance then
+			ids[#ids + 1] = info.recipeID
+		end
+	end
+	table.sort(ids)
+	return table.concat(ids, ",")
+end
+
+-- Copy live fields (craftable count, etc.) from Blizzard's tree onto the flat list without
+-- swapping the provider — that is what made the selected craft flash on every craft.
+local function PatchFlatRecipeInfos(flat, source)
+	local fresh = {}
+	for _, node in source:EnumerateEntireRange() do
+		local d = NodeData(node)
+		local info = d and d.recipeInfo
+		if info and info.recipeID and not info.favoritesInstance then
+			fresh[info.recipeID] = info
+		end
+	end
+	for _, node in flat:EnumerateEntireRange() do
+		local d = NodeData(node)
+		local info = d and d.recipeInfo
+		local src = info and fresh[info.recipeID]
+		if src then
+			if CopyTable then
+				d.recipeInfo = CopyTable(src)
+			else
+				for k, v in pairs(src) do info[k] = v end
+			end
+		end
+	end
+	local scrollBox = RecipeScrollBox()
+	if scrollBox and type(scrollBox.ForEachFrame) == "function" then
+		scrollBox:ForEachFrame(function(frame, elementData)
+			if frame and frame.Label and frame.SkillUps then
+				UI:UpdateRow(frame, elementData)
+			end
+		end)
+	end
+end
+
 local function InstallFlatProvider(flat)
 	local scrollBox = RecipeScrollBox()
 	if not scrollBox or not flat or type(scrollBox.SetDataProvider) ~= "function" then return false end
+	local recipeID = CurrentRecipeID()
+	local scrollPct = type(scrollBox.GetScrollPercentage) == "function" and scrollBox:GetScrollPercentage() or nil
 	ungroupApplying = true
 	scrollBox:SetDataProvider(flat)
 	ungroupApplying = false
+	if recipeID and C_TradeSkillUI and C_TradeSkillUI.OpenRecipe then
+		pcall(C_TradeSkillUI.OpenRecipe, recipeID)
+	end
+	if scrollPct and type(scrollBox.SetScrollPercentage) == "function" then
+		After(0, function()
+			local box = RecipeScrollBox()
+			if box and type(box.SetScrollPercentage) == "function" then
+				box:SetScrollPercentage(scrollPct)
+			end
+		end)
+	end
 	return not ProviderHasCategories(scrollBox:GetDataProvider())
 end
 
@@ -1007,11 +1074,24 @@ end
 function UI:ApplyUngroup(sourceProvider)
 	if ungroupApplying or not CP.settings.ungroupRecipes then return false end
 	local source = sourceProvider
+	local scrollBox = RecipeScrollBox()
 	if not source then
-		local scrollBox = RecipeScrollBox()
 		source = scrollBox and type(scrollBox.GetDataProvider) == "function" and scrollBox:GetDataProvider()
 	end
 	if not source or not ProviderHasCategories(source) then return false end
+
+	-- Craft / reagent updates rebuild Blizzard's grouped tree. If we already show the same
+	-- flat recipe set, patch counts in place so the selection does not flash.
+	local current = scrollBox and type(scrollBox.GetDataProvider) == "function" and scrollBox:GetDataProvider()
+	if current and not ProviderHasCategories(current)
+		and RecipeSetSignature(current) == RecipeSetSignature(source) then
+		local ok = pcall(PatchFlatRecipeInfos, current, source)
+		if ok then
+			if CP.settings.profitableOnly then self:ApplyFilter(current) end
+			self:ApplySort(current)
+			return true
+		end
+	end
 
 	local replaced = false
 	local ok, err = pcall(function()
@@ -1037,6 +1117,16 @@ function UI:RebuildFlatList()
 	local replaced = false
 	local ok, err = pcall(function()
 		local grouped = Professions.GenerateCraftingDataProvider(professionID, SearchingRecipes(page))
+		local scrollBox = RecipeScrollBox()
+		local current = scrollBox and type(scrollBox.GetDataProvider) == "function" and scrollBox:GetDataProvider()
+		if current and not ProviderHasCategories(current)
+			and RecipeSetSignature(current) == RecipeSetSignature(grouped) then
+			PatchFlatRecipeInfos(current, grouped)
+			if CP.settings.profitableOnly then UI:ApplyFilter(current) end
+			UI:ApplySort(current)
+			replaced = true
+			return
+		end
 		local flat = BuildFlatProvider(grouped)
 		if not flat then return end
 		replaced = InstallFlatProvider(flat)
@@ -1219,12 +1309,7 @@ CP:RegisterEvent("TRADE_SKILL_SHOW", function()
 end)
 
 CP:RegisterEvent("TRADE_SKILL_LIST_UPDATE", function()
-	-- Debounced: list updates can spam; RebuildFlatList avoids a grouped flash.
-	if not CP.settings.ungroupRecipes then return end
-	if ungroupQueued then return end
-	ungroupQueued = true
-	After(0.05, function()
-		ungroupQueued = false
-		if CP.settings.ungroupRecipes then UI:RebuildFlatList() end
-	end)
+	-- Blizzard rebuilds the list (and our SetDataProvider hook flattens or patches in place).
+	-- Do not force another RebuildFlatList here — that was flashing the selected craft.
+	if CP.settings.ungroupRecipes then UI:QueueEnsureUngrouped() end
 end)
