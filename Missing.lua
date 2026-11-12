@@ -382,9 +382,9 @@ function Missing:ScanChunk()
 	self.scan = nil
 	local total = self.rowTotal or #self.rows
 	CP:Debug("missing: done, %d profitable of %d priced in %.2fs", total, s.priced, (Now() - s.started) / 1000)
-	if self.ui and self.ui.active then
-		CP:Print("missing profitable: %d of %d unlearned recipes priced.", total, s.priced)
-	end
+	-- Never Print completion to chat here: TRADE_SKILL_LIST_UPDATE / price ticks used to
+	-- restart the scan while the tab stayed open, and every craft spammed General.
+	-- The tab status line already shows the count; /cf missing uses FinishReport.
 	self:UpdateStatus()
 	self:RefreshList()
 	if self.reportAfterScan then
@@ -1006,16 +1006,22 @@ end
 -- Events
 ---------------------------------------------------------------------------
 
-CP:On("PRICES_UPDATED", function()
-	if Missing.ui and Missing.ui.active then Missing:StartScan(nil) end
-end)
-CP:On("VENDOR_UPDATED", function()
-	if Missing.ui and Missing.ui.active then Missing:StartScan(nil) end
-end)
+-- Coalesce auto-rescans: price/craft events can burst, and we must not kick off a
+-- 500+ recipe pass (plus chat noise) on every single craft tick.
+local rescanQueued = false
+local function QueueActiveRescan()
+	if not (Missing.ui and Missing.ui.active) or rescanQueued then return end
+	rescanQueued = true
+	After(0.5, function()
+		rescanQueued = false
+		if Missing.ui and Missing.ui.active then Missing:StartScan(nil) end
+	end)
+end
+
+CP:On("PRICES_UPDATED", function() QueueActiveRescan() end)
+CP:On("VENDOR_UPDATED", function() QueueActiveRescan() end)
 CP:On("SETTINGS_CHANGED", function() Missing:SyncTab() end)
-CP:On("CRAFTS_UPDATED", function()
-	if Missing.ui and Missing.ui.active then Missing:StartScan(nil) end
-end)
+CP:On("CRAFTS_UPDATED", function() QueueActiveRescan() end)
 
 CP:RegisterEvent("ADDON_LOADED", function(_, name)
 	if name == "Blizzard_Professions" or name == "ForeverMaster" then Missing:Setup() end
@@ -1032,12 +1038,11 @@ CP:RegisterEvent("TRADE_SKILL_SHOW", function()
 	After(0, function() Missing:SyncTab() end)
 end)
 
-CP:RegisterEvent("TRADE_SKILL_LIST_UPDATE", function()
-	if Missing.ui and Missing.ui.active then Missing:StartScan(nil) end
-end)
+-- Do not rescan on TRADE_SKILL_LIST_UPDATE: that fires on every craft (craftable
+-- counts) and does not change which ForeverMaster recipes are still unlearned.
 
 CP:RegisterEvent("NEW_RECIPE_LEARNED", function()
-	if Missing.ui and Missing.ui.active then Missing:StartScan(nil) end
+	QueueActiveRescan()
 end)
 
 -- Item icons for unlearned crafts often arrive after the first paint.

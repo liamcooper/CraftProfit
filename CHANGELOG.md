@@ -13,6 +13,8 @@
   list sorted by profit, so the best craft is at the top instead of buried under Everyday Meals / Stamina Food.
 - Fix: Ungroup + Profitable only no longer recurse through `OpenRecipe` → `SetDataProvider` until
   `TreeListDataProvider` hits a C stack overflow.
+- Fix: the missing-recipes tab no longer prints `missing profitable: N of M…` to chat on every
+  craft while the tab is open (status line only; `/cf missing` still reports in chat).
 
 ## 0.5.0
 
