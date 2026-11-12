@@ -912,14 +912,15 @@ end
 -- Ungroup recipes
 ---------------------------------------------------------------------------
 
--- Replaces the recipe tree with a brand-new flat CreateTreeDataProvider (no category headers),
--- sorted by profit. Favorites duplicates are dropped. Turning it off rebuilds via RebuildList.
+-- Builds a flat CreateTreeDataProvider (no category headers) sorted by profit, and installs it
+-- in one SetDataProvider call. Favorites duplicates are dropped.
 --
--- Forever often ignores a nested ScrollBox:SetDataProvider call made from inside another
--- SetDataProvider hook (first open works; untick/retick does not). Flattening is therefore
--- queued for the next frames via EnsureUngrouped, and re-checked if something restores groups.
+-- Important for flicker: never put the grouped Blizzard tree on screen first when ungroup is on.
+-- Generate it in memory, flatten, then swap once. A single debounced next-frame pass catches the
+-- case where Forever restores groups after our swap (without the old 4-timer hammer).
 
 local ungroupApplying = false
+local ungroupQueued = false
 
 local function CollectRecipeInfos(dataProvider)
 	local seen = {}
@@ -964,84 +965,112 @@ local function RecipeScrollBox()
 	return page and page.RecipeList and page.RecipeList.ScrollBox
 end
 
-function UI:ApplyUngroup(dataProvider)
-	if ungroupApplying or not dataProvider or not CP.settings.ungroupRecipes then return false end
-	if type(CreateTreeDataProvider) ~= "function" then
-		CP:Debug("ungroup: CreateTreeDataProvider missing")
-		return false
+local function SearchingRecipes(page)
+	local box = page and page.RecipeList and page.RecipeList.SearchBox
+	if box and box.GetText then
+		local text = box:GetText()
+		return text ~= nil and text ~= ""
 	end
-	local scrollBox = RecipeScrollBox()
-	if not scrollBox or type(scrollBox.SetDataProvider) ~= "function" then return false end
-	if not ProviderHasCategories(dataProvider) then return false end
+	return false
+end
 
-	local replaced, recipeCount = false, 0
-	local ok, err = pcall(function()
-		local recipes = CollectRecipeInfos(dataProvider)
-		recipeCount = #recipes
-		if recipeCount == 0 then return end
-		local flat = CreateTreeDataProvider()
-		local root = flat:GetRootNode()
-		-- Install our comparator before Insert: the default root sorter is SortRootData, which
-		-- assumes every child has categoryInfo and errors on recipe rows (line 779).
-		if type(root.SetSortComparator) == "function" then
-			root:SetSortComparator(ProfitComparator, false, true)
-		end
-		for _, info in ipairs(recipes) do
-			local copy = (CopyTable and CopyTable(info)) or info
-			root:Insert({ recipeInfo = copy, order = 0, group = 1 })
-		end
-		if type(root.Sort) == "function" then root:Sort() end
-		ungroupApplying = true
-		scrollBox:SetDataProvider(flat)
-		ungroupApplying = false
-		replaced = not ProviderHasCategories(scrollBox:GetDataProvider())
-	end)
+local function BuildFlatProvider(sourceProvider)
+	if type(CreateTreeDataProvider) ~= "function" or not sourceProvider then return nil, 0 end
+	if CP.settings.profitableOnly then UI:ApplyFilter(sourceProvider) end
+	local recipes = CollectRecipeInfos(sourceProvider)
+	if #recipes == 0 then return nil, 0 end
+	local flat = CreateTreeDataProvider()
+	local root = flat:GetRootNode()
+	-- Install our comparator before Insert: the default root sorter is SortRootData, which
+	-- assumes every child has categoryInfo and errors on recipe rows (line 779).
+	if type(root.SetSortComparator) == "function" then
+		root:SetSortComparator(ProfitComparator, false, true)
+	end
+	for _, info in ipairs(recipes) do
+		local copy = (CopyTable and CopyTable(info)) or info
+		root:Insert({ recipeInfo = copy, order = 0, group = 1 })
+	end
+	if type(root.Sort) == "function" then root:Sort() end
+	return flat, #recipes
+end
+
+local function InstallFlatProvider(flat)
+	local scrollBox = RecipeScrollBox()
+	if not scrollBox or not flat or type(scrollBox.SetDataProvider) ~= "function" then return false end
+	ungroupApplying = true
+	scrollBox:SetDataProvider(flat)
 	ungroupApplying = false
-	if not ok then
-		CP:Debug("ungroup failed: %s", tostring(err))
-		return false
+	return not ProviderHasCategories(scrollBox:GetDataProvider())
+end
+
+-- Flatten `sourceProvider` (or the ScrollBox's current provider) into one on-screen list.
+function UI:ApplyUngroup(sourceProvider)
+	if ungroupApplying or not CP.settings.ungroupRecipes then return false end
+	local source = sourceProvider
+	if not source then
+		local scrollBox = RecipeScrollBox()
+		source = scrollBox and type(scrollBox.GetDataProvider) == "function" and scrollBox:GetDataProvider()
 	end
-	if replaced then
-		CP:Debug("ungroup: flattened %d recipes", recipeCount)
-	elseif recipeCount > 0 then
-		CP:Debug("ungroup: SetDataProvider did not stick (%d recipes)", recipeCount)
-	end
+	if not source or not ProviderHasCategories(source) then return false end
+
+	local replaced = false
+	local ok, err = pcall(function()
+		local flat = BuildFlatProvider(source)
+		if not flat then return end
+		replaced = InstallFlatProvider(flat)
+	end)
+	if not ok then CP:Debug("ungroup failed: %s", tostring(err)) end
 	return replaced
 end
 
--- If categories are still present, flatten now. Safe to call repeatedly.
-function UI:EnsureUngrouped(reason)
+-- Fresh Blizzard tree in memory → flat list → one SetDataProvider. No grouped flash.
+function UI:RebuildFlatList()
+	if ungroupApplying or not CP.settings.ungroupRecipes then return false end
+	local page = ProfessionsFrame and ProfessionsFrame.CraftingPage
+	if not page or not page.professionInfo or not ProfessionsFrame:IsShown() then return false end
+	local info = page.professionInfo
+	local professionID = info.professionID or info.skillLineID
+	if not (Professions and type(Professions.GenerateCraftingDataProvider) == "function" and professionID) then
+		return self:ApplyUngroup(nil)
+	end
+
+	local replaced = false
+	local ok, err = pcall(function()
+		local grouped = Professions.GenerateCraftingDataProvider(professionID, SearchingRecipes(page))
+		local flat = BuildFlatProvider(grouped)
+		if not flat then return end
+		replaced = InstallFlatProvider(flat)
+	end)
+	if not ok then CP:Debug("ungroup rebuild failed: %s", tostring(err)) end
+	return replaced
+end
+
+-- Only acts when categories are back on screen; no-op if already flat (avoids sort flicker).
+function UI:EnsureUngrouped()
 	if not CP.settings.ungroupRecipes then return false end
 	local scrollBox = RecipeScrollBox()
 	local dp = scrollBox and type(scrollBox.GetDataProvider) == "function" and scrollBox:GetDataProvider()
 	if not dp then return false end
-	if not ProviderHasCategories(dp) then
-		self:ApplySort(dp)
-		return true
-	end
-	if CP.settings.profitableOnly then self:ApplyFilter(dp) end
-	local ok = self:ApplyUngroup(dp)
-	local current = scrollBox:GetDataProvider() or dp
-	self:ApplySort(current)
-	return ok
+	if not ProviderHasCategories(dp) then return true end
+	return self:ApplyUngroup(dp)
 end
 
-function UI:QueueEnsureUngrouped(reason)
-	if not CP.settings.ungroupRecipes then return end
-	-- Next frames: Forever often restores the grouped provider in the same frame as our swap.
-	for _, delay in ipairs({ 0, 0.05, 0.2, 0.5 }) do
-		After(delay, function()
-			if CP.settings.ungroupRecipes then UI:EnsureUngrouped(reason) end
-		end)
-	end
+function UI:QueueEnsureUngrouped()
+	if not CP.settings.ungroupRecipes or ungroupQueued then return end
+	ungroupQueued = true
+	After(0, function()
+		ungroupQueued = false
+		if CP.settings.ungroupRecipes then UI:EnsureUngrouped() end
+	end)
 end
 
 function UI:SetUngroupRecipes(enabled)
 	CP.settings.ungroupRecipes = enabled and true or false
 	CP.touched.ungroupRecipes = true
-	self:RebuildList()
 	if enabled then
-		self:QueueEnsureUngrouped("toggle")
+		self:RebuildFlatList()
+	else
+		self:RebuildList()
 	end
 	CP:Fire("UNGROUP_CHANGED", CP.settings.ungroupRecipes)
 end
@@ -1069,11 +1098,17 @@ function UI:RefreshAll()
 		-- prices changed: drop newly unprofitable rows, then re-sort with the new numbers
 		if type(list.ScrollBox.GetDataProvider) == "function" then
 			local dataProvider = list.ScrollBox:GetDataProvider()
-			if CP.settings.profitableOnly then self:ApplyFilter(dataProvider) end
 			if CP.settings.ungroupRecipes then
-				self:QueueEnsureUngrouped("refresh")
-			elseif CP.settings.sortByProfit then
-				self:ApplySort(dataProvider)
+				if dataProvider and not ProviderHasCategories(dataProvider) then
+					-- Already flat: update in place so price ticks do not rebuild the whole list.
+					if CP.settings.profitableOnly then self:ApplyFilter(dataProvider) end
+					self:ApplySort(dataProvider)
+				else
+					self:RebuildFlatList()
+				end
+			else
+				if CP.settings.profitableOnly then self:ApplyFilter(dataProvider) end
+				if CP.settings.sortByProfit then self:ApplySort(dataProvider) end
 			end
 		end
 	end
@@ -1123,14 +1158,16 @@ function UI:Setup()
 
 	hooksecurefunc(page.SchematicForm, "Init", OnFormInit)
 
-	hooksecurefunc(page.RecipeList.ScrollBox, "SetDataProvider", function(scroll, dataProvider)
+	hooksecurefunc(page.RecipeList.ScrollBox, "SetDataProvider", function(_, dataProvider)
 		if ungroupApplying then return end -- our own flat provider; do not recurse
-		UI:ApplyFilter(dataProvider)
 		if CP.settings.ungroupRecipes then
-			-- Do not flatten synchronously: Forever drops nested SetDataProvider calls.
-			UI:QueueEnsureUngrouped("provider")
-		elseif CP.settings.sortByProfit then
-			UI:ApplySort(dataProvider)
+			-- Flatten immediately so the grouped tree never paints. One next-frame check
+			-- covers Forever restoring groups; no multi-timer hammer.
+			UI:ApplyUngroup(dataProvider)
+			UI:QueueEnsureUngrouped()
+		else
+			UI:ApplyFilter(dataProvider)
+			if CP.settings.sortByProfit then UI:ApplySort(dataProvider) end
 		end
 	end)
 
@@ -1178,9 +1215,16 @@ CP:RegisterEvent("TRADE_SKILL_SHOW", function()
 		UI.warned = true
 		CP:Print("could not find the retail profession window (ProfessionsFrame). This client's profession UI is not supported yet.")
 	end
-	if CP.settings.ungroupRecipes then UI:QueueEnsureUngrouped("show") end
+	if CP.settings.ungroupRecipes then UI:QueueEnsureUngrouped() end
 end)
 
 CP:RegisterEvent("TRADE_SKILL_LIST_UPDATE", function()
-	if CP.settings.ungroupRecipes then UI:QueueEnsureUngrouped("list") end
+	-- Debounced: list updates can spam; RebuildFlatList avoids a grouped flash.
+	if not CP.settings.ungroupRecipes then return end
+	if ungroupQueued then return end
+	ungroupQueued = true
+	After(0.05, function()
+		ungroupQueued = false
+		if CP.settings.ungroupRecipes then UI:RebuildFlatList() end
+	end)
 end)
