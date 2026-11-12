@@ -15,6 +15,9 @@
   `TreeListDataProvider` hits a C stack overflow.
 - Fix: the missing-recipes tab no longer prints `missing profitable: N of M…` to chat on every
   craft while the tab is open (status line only; `/cf missing` still reports in chat).
+- Fix: when Forever cannot round-trip addon CVars, the shared price cache disables itself quietly
+  (no `push FAILED` chat after every scan). Prices stay in local SavedVariables; `/cf status` still
+  shows why Share is off.
 
 ## 0.5.0
 

@@ -22,21 +22,13 @@ CP.Share = Share
 local PREFIX = "CraftProfitShare"
 local META = PREFIX .. "Meta"
 local VERSION = 1
+local PROBE = "cpok" -- short alphanumeric; Forever has failed even 200-char round-trips
 
 local function Available()
 	return C_CVar ~= nil and type(C_CVar.RegisterCVar) == "function"
 		and type(C_CVar.SetCVar) == "function" and type(C_CVar.GetCVar) == "function"
 end
 Share.Available = Available
-
-local registered = false
-function Share:Register()
-	if registered or not Available() then return registered end
-	pcall(C_CVar.RegisterCVar, META, "")
-	for i = 1, self.maxChunks do pcall(C_CVar.RegisterCVar, PREFIX .. i, "") end
-	registered = true
-	return true
-end
 
 local function Get(name)
 	local ok, v = pcall(C_CVar.GetCVar, name)
@@ -51,6 +43,58 @@ end
 
 local function Clean(name)
 	return (tostring(name or ""):gsub("[^%w]", ""))
+end
+
+-- nil = not probed yet; true/false = this client can/cannot round-trip addon CVar strings.
+local usable = nil
+
+local function MarkUnusable(why)
+	usable = false
+	Share.status = why or "unavailable (CVar values do not round-trip on this client)"
+	CP:Debug("share: %s", Share.status)
+end
+
+-- One cheap Set/Get on chunk 1. If that fails, Push would only spam chat every scan.
+local function Probe()
+	if usable ~= nil then return usable end
+	if not Available() then
+		MarkUnusable("unavailable (C_CVar.RegisterCVar / SetCVar / GetCVar missing)")
+		return false
+	end
+	local name = PREFIX .. "1"
+	local previous = Get(name) or ""
+	if not Set(name, PROBE) or Get(name) ~= PROBE then
+		pcall(Set, name, previous)
+		MarkUnusable("unavailable (CVar values do not round-trip on this client; using local SavedVariables only)")
+		return false
+	end
+	-- Restore whatever was there so we do not wipe a good cache during login probe.
+	if previous ~= PROBE then Set(name, previous) end
+	usable = true
+	return true
+end
+
+function Share:Usable()
+	if not Available() then return false end
+	if usable == nil then
+		self:Register()
+	end
+	return usable == true
+end
+
+local registered = false
+function Share:Register()
+	if not Available() then
+		MarkUnusable("unavailable (C_CVar.RegisterCVar / SetCVar / GetCVar missing)")
+		return false
+	end
+	if not registered then
+		pcall(C_CVar.RegisterCVar, META, "")
+		for i = 1, self.maxChunks do pcall(C_CVar.RegisterCVar, PREFIX .. i, "") end
+		registered = true
+	end
+	Probe()
+	return usable == true
 end
 
 ---------------------------------------------------------------------------
@@ -161,11 +205,11 @@ end
 
 -- Writes the shared cache. Returns prices written (or nil) and an info table.
 function Share:Push(reason)
-	if not Available() then
-		self.status = "unavailable (C_CVar.RegisterCVar / SetCVar / GetCVar missing)"
-		return nil, { ok = false, reason = self.status }
+	if not self:Register() then
+		self.lastPush = { at = time(), reason = reason, ok = false, skipped = true }
+		-- Quiet: Forever often cannot round-trip addon CVars; local SavedVariables still hold prices.
+		return nil, self.lastPush
 	end
-	self:Register()
 	local attempts = 0
 	while true do
 		attempts = attempts + 1
@@ -197,9 +241,10 @@ function Share:Push(reason)
 		end
 		-- the client truncated or refused the value: try smaller chunks
 		if self.chunkSize <= self.minChunk or attempts >= 8 then
+			MarkUnusable(string.format(
+				"unavailable (CVar values do not round-trip even at %d characters; using local SavedVariables only)",
+				self.chunkSize))
 			self.lastPush = { at = time(), reason = reason, ok = false, chunkSize = self.chunkSize }
-			self.status = string.format("push FAILED: CVar values do not round-trip even at %d characters", self.chunkSize)
-			CP:Print("shared price cache could not be written (%s).", self.status)
 			return nil, self.lastPush
 		end
 		self.chunkSize = math.max(self.minChunk, math.floor(self.chunkSize / 2))
@@ -208,11 +253,9 @@ end
 
 -- Reads the shared cache and merges newer prices into the database. Returns the number of prices merged.
 function Share:Pull(reason)
-	if not Available() then
-		self.status = "unavailable (C_CVar.RegisterCVar / SetCVar / GetCVar missing)"
+	if not self:Register() then
 		return 0
 	end
-	self:Register()
 	local meta = Get(META)
 	if not meta or meta == "" then
 		self.lastPull = { at = time(), reason = reason, found = false }
@@ -284,8 +327,7 @@ end
 
 -- Empties the shared cache (used by /cf reset so the wiped prices do not come back at the next pull).
 function Share:Clear()
-	if not Available() then return end
-	self:Register()
+	if not self:Usable() then return end
 	Set(META, "")
 	for i = 1, self.maxChunks do Set(PREFIX .. i, "") end
 	self.lastPush = nil
@@ -293,7 +335,12 @@ function Share:Clear()
 end
 
 function Share:Status()
-	if not Available() then return "Shared price cache: unavailable on this client (C_CVar.RegisterCVar missing)." end
+	if not Available() then
+		return "Shared price cache: unavailable on this client (C_CVar.RegisterCVar missing)."
+	end
+	if usable == false then
+		return "Shared price cache: " .. tostring(self.status) .. "."
+	end
 	local s = "Shared price cache (account-wide CVars): " .. tostring(self.status) .. "."
 	if self.lastPush and self.lastPush.ok then
 		s = s .. string.format(" Last push %s (%s).", CP:FormatAge(time() - self.lastPush.at), tostring(self.lastPush.reason))
@@ -302,14 +349,16 @@ function Share:Status()
 end
 
 function Share:OnLogout()
-	if not Available() then return end
+	if not self:Usable() then return end
 	pcall(self.Pull, self, "logout")
 	pcall(self.Push, self, "logout")
 end
 
 CP:On("READY", function()
 	Share:Register()
-	Share:Pull("login")
+	if Share:Usable() then Share:Pull("login") end
 end)
-CP:On("DB_ADOPTED", function() Share:Pull("adopted") end)
+CP:On("DB_ADOPTED", function()
+	if Share:Usable() then Share:Pull("adopted") end
+end)
 CP:On("SCAN_FINISHED", function() Share:Push("scan") end)
