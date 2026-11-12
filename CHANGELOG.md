@@ -2,8 +2,15 @@
 
 ## Unreleased
 
+- **Missing profitable recipes**: a side tab on the profession window (and `/cf missing`) lists crafts
+  you have not learned yet where Auction House net or vendor net is positive. Uses ForeverMaster's
+  Forever recipe catalog for trainer and Plans/Pattern recipes of the professions you have. Hover a
+  row for cost, both nets and the recipe source (trainer or recipe item). Toggle with options or
+  `/cf missing on|off`.
 - **Profitable only**: a Filter menu / options / `/cf profit` toggle that hides recipes whose craft
   profit is negative. Recipes with missing prices stay visible; empty categories are culled from the list.
+- **Ungroup recipes**: Filter menu / options / `/cf ungroup` drops category headers and shows one flat
+  list sorted by profit, so the best craft is at the top instead of buried under Everyday Meals / Stamina Food.
 
 ## 0.5.0
 

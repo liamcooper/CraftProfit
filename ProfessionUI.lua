@@ -5,12 +5,17 @@
 --   * "Profit - Auction House" (or "- Vendor", per the netBasis setting) panel in the recipe details
 --   * optional sort-by-profit within categories (Filter dropdown, panel checkbox, /cf sort); see "Sort by profit"
 --   * optional profitable-only filter (Filter dropdown, /cf profit); see "Profitable only"
+--   * optional ungroup (Filter dropdown, /cf ungroup): drop category headers and sort one flat list
 
 local _, CP = ...
 local UI = {}
 CP.UI = UI
 
 local C = CP.COLORS
+
+local function After(seconds, fn)
+	if C_Timer and C_Timer.After then C_Timer.After(seconds, fn) else fn() end
+end
 -- Fixed width budget for the row tag so the recipe name always gets a predictable remainder.
 -- Rows are ~250px; Blizzard uses ~21px (skill-up arrow) + the "[n]" craftable count.
 local TAG_WIDTH = { profit = 46, margin = 40, both = 84 }
@@ -708,22 +713,33 @@ end
 -- The tree caches its flattened row list; node:Sort() does not clear that cache (TreeListDataProvider.lua),
 -- so after sorting the provider is invalidated, which is what makes the ScrollBox show the new order.
 
-local blizzardSort -- Blizzard's comparator for category nodes (SortCategoryData), captured from the list
+local blizzardSort -- Blizzard SortCategoryData only (safe with recipe children). Never SortRootData —
+-- that indexes .categoryInfo unconditionally and blows up on a flat recipe list (Blizzard_Professions.lua:779).
 
 local function ProfitComparator(lhs, rhs)
 	local a, b = NodeData(lhs), NodeData(rhs)
 	local ar, br = a and a.recipeInfo, b and b.recipeInfo
-	if ar and br and not a.categoryInfo and not b.categoryInfo and (a.order or 0) == (b.order or 0) then
-		local pa, pb = UI:GetNet(ar.recipeID), UI:GetNet(br.recipeID)
-		if pa ~= pb then
-			if pa == nil then return false end
-			if pb == nil then return true end
-			return pa > pb
+	-- Recipe rows: always compare by profit (within a category, or across a flattened list).
+	if ar and br and not a.categoryInfo and not b.categoryInfo then
+		local sameBucket = CP.settings.ungroupRecipes or (a.order or 0) == (b.order or 0)
+		if sameBucket then
+			local pa, pb = UI:GetNet(ar.recipeID), UI:GetNet(br.recipeID)
+			if pa ~= pb then
+				if pa == nil then return false end
+				if pb == nil then return true end
+				return pa > pb
+			end
+			return strcmputf8i(ar.name or "", br.name or "") < 0
 		end
 	end
-	if blizzardSort then return blizzardSort(lhs, rhs) end
-	-- no Blizzard comparator seen (should not happen): categories first, then padding order, then name
-	if (a and a.categoryInfo) or (b and b.categoryInfo) then return (a and a.categoryInfo and not (b and b.categoryInfo)) and true or false end
+	-- Both category headers: Blizzard's category order is fine.
+	if a and a.categoryInfo and b and b.categoryInfo and blizzardSort then
+		return blizzardSort(lhs, rhs)
+	end
+	-- Categories before recipes / padding; never call SortRootData here.
+	if (a and a.categoryInfo) or (b and b.categoryInfo) then
+		return (a and a.categoryInfo and not (b and b.categoryInfo)) and true or false
+	end
 	local ao, bo = a and a.order or 0, b and b.order or 0
 	if ao ~= bo then return ao < bo end
 	return strcmputf8i((ar and ar.name) or "", (br and br.name) or "") < 0
@@ -732,7 +748,8 @@ end
 -- Applies (or removes) the profit order on a recipe list data provider. Returns true when it re-sorted.
 function UI:ApplySort(dataProvider)
 	if not dataProvider or type(dataProvider.EnumerateEntireRange) ~= "function" then return false end
-	local want = CP.settings.sortByProfit and true or false
+	-- A flattened list is useless unless it is sorted by profit; ungroup implies that order.
+	local want = (CP.settings.sortByProfit or CP.settings.ungroupRecipes) and true or false
 	local changed = false
 	local ok, err = pcall(function()
 		local nodes = {}
@@ -743,6 +760,12 @@ function UI:ApplySort(dataProvider)
 				local current = node.sortComparator
 				if current and current ~= ProfitComparator then blizzardSort = current end
 			end
+		end
+		-- Flat list: recipes sit under the root, so sort that node too.
+		local root = type(dataProvider.GetRootNode) == "function" and dataProvider:GetRootNode() or nil
+		if root and type(root.SetSortComparator) == "function" then
+			table.insert(nodes, root)
+			-- Do not capture root.sortComparator (SortRootData) — it crashes on recipe rows.
 		end
 		for _, node in ipairs(nodes) do
 			if want then
@@ -790,13 +813,31 @@ end
 
 local rebuildingList = false
 
+-- Rebuild the recipe ScrollBox from Blizzard's grouped tree. page:Init is often a no-op while the
+-- same profession stays open (so Filter toggles did nothing after the first apply); regenerating
+-- via GenerateCraftingDataProvider always fires SetDataProvider and our filter/ungroup/sort hooks.
 function UI:RebuildList()
 	if rebuildingList then return end
 	local page = ProfessionsFrame and ProfessionsFrame.CraftingPage
 	if not page or not page.professionInfo or not ProfessionsFrame:IsShown() then return end
-	if type(page.Init) ~= "function" then return end
 	rebuildingList = true
-	local ok, err = pcall(page.Init, page, page.professionInfo)
+	local ok, err = pcall(function()
+		local info = page.professionInfo
+		local scrollBox = page.RecipeList and page.RecipeList.ScrollBox
+		local professionID = info.professionID or info.skillLineID
+		if scrollBox and Professions and type(Professions.GenerateCraftingDataProvider) == "function" and professionID then
+			local searching = false
+			local box = page.RecipeList.SearchBox
+			if box and box.GetText then
+				local text = box:GetText()
+				searching = text ~= nil and text ~= ""
+			end
+			local dataProvider = Professions.GenerateCraftingDataProvider(professionID, searching)
+			scrollBox:SetDataProvider(dataProvider)
+		elseif type(page.Init) == "function" then
+			page:Init(info)
+		end
+	end)
 	rebuildingList = false
 	if not ok then CP:Debug("list rebuild failed: %s", tostring(err)) end
 end
@@ -868,6 +909,144 @@ function UI:SetProfitableOnly(enabled)
 end
 
 ---------------------------------------------------------------------------
+-- Ungroup recipes
+---------------------------------------------------------------------------
+
+-- Replaces the recipe tree with a brand-new flat CreateTreeDataProvider (no category headers),
+-- sorted by profit. Favorites duplicates are dropped. Turning it off rebuilds via RebuildList.
+--
+-- Forever often ignores a nested ScrollBox:SetDataProvider call made from inside another
+-- SetDataProvider hook (first open works; untick/retick does not). Flattening is therefore
+-- queued for the next frames via EnsureUngrouped, and re-checked if something restores groups.
+
+local ungroupApplying = false
+
+local function CollectRecipeInfos(dataProvider)
+	local seen = {}
+	if type(dataProvider.EnumerateEntireRange) ~= "function" then return {} end
+	for _, node in dataProvider:EnumerateEntireRange() do
+		local d = NodeData(node)
+		if d and d.recipeInfo and d.recipeInfo.recipeID and not d.categoryInfo then
+			local info = d.recipeInfo
+			local id = info.recipeID
+			local prev = seen[id]
+			-- Prefer the normal row over the Favorites duplicate.
+			if not prev or (prev.favoritesInstance and not info.favoritesInstance) then
+				seen[id] = info
+			end
+		end
+	end
+	local list = {}
+	for _, info in pairs(seen) do list[#list + 1] = info end
+	table.sort(list, function(a, b)
+		local pa, pb = UI:GetNet(a.recipeID), UI:GetNet(b.recipeID)
+		if pa ~= pb then
+			if pa == nil then return false end
+			if pb == nil then return true end
+			return pa > pb
+		end
+		return strcmputf8i(a.name or "", b.name or "") < 0
+	end)
+	return list
+end
+
+local function ProviderHasCategories(dataProvider)
+	if not dataProvider or type(dataProvider.EnumerateEntireRange) ~= "function" then return false end
+	for _, node in dataProvider:EnumerateEntireRange() do
+		local d = NodeData(node)
+		if d and d.categoryInfo then return true end
+	end
+	return false
+end
+
+local function RecipeScrollBox()
+	local page = ProfessionsFrame and ProfessionsFrame.CraftingPage
+	return page and page.RecipeList and page.RecipeList.ScrollBox
+end
+
+function UI:ApplyUngroup(dataProvider)
+	if ungroupApplying or not dataProvider or not CP.settings.ungroupRecipes then return false end
+	if type(CreateTreeDataProvider) ~= "function" then
+		CP:Debug("ungroup: CreateTreeDataProvider missing")
+		return false
+	end
+	local scrollBox = RecipeScrollBox()
+	if not scrollBox or type(scrollBox.SetDataProvider) ~= "function" then return false end
+	if not ProviderHasCategories(dataProvider) then return false end
+
+	local replaced, recipeCount = false, 0
+	local ok, err = pcall(function()
+		local recipes = CollectRecipeInfos(dataProvider)
+		recipeCount = #recipes
+		if recipeCount == 0 then return end
+		local flat = CreateTreeDataProvider()
+		local root = flat:GetRootNode()
+		-- Install our comparator before Insert: the default root sorter is SortRootData, which
+		-- assumes every child has categoryInfo and errors on recipe rows (line 779).
+		if type(root.SetSortComparator) == "function" then
+			root:SetSortComparator(ProfitComparator, false, true)
+		end
+		for _, info in ipairs(recipes) do
+			local copy = (CopyTable and CopyTable(info)) or info
+			root:Insert({ recipeInfo = copy, order = 0, group = 1 })
+		end
+		if type(root.Sort) == "function" then root:Sort() end
+		ungroupApplying = true
+		scrollBox:SetDataProvider(flat)
+		ungroupApplying = false
+		replaced = not ProviderHasCategories(scrollBox:GetDataProvider())
+	end)
+	ungroupApplying = false
+	if not ok then
+		CP:Debug("ungroup failed: %s", tostring(err))
+		return false
+	end
+	if replaced then
+		CP:Debug("ungroup: flattened %d recipes", recipeCount)
+	elseif recipeCount > 0 then
+		CP:Debug("ungroup: SetDataProvider did not stick (%d recipes)", recipeCount)
+	end
+	return replaced
+end
+
+-- If categories are still present, flatten now. Safe to call repeatedly.
+function UI:EnsureUngrouped(reason)
+	if not CP.settings.ungroupRecipes then return false end
+	local scrollBox = RecipeScrollBox()
+	local dp = scrollBox and type(scrollBox.GetDataProvider) == "function" and scrollBox:GetDataProvider()
+	if not dp then return false end
+	if not ProviderHasCategories(dp) then
+		self:ApplySort(dp)
+		return true
+	end
+	if CP.settings.profitableOnly then self:ApplyFilter(dp) end
+	local ok = self:ApplyUngroup(dp)
+	local current = scrollBox:GetDataProvider() or dp
+	self:ApplySort(current)
+	return ok
+end
+
+function UI:QueueEnsureUngrouped(reason)
+	if not CP.settings.ungroupRecipes then return end
+	-- Next frames: Forever often restores the grouped provider in the same frame as our swap.
+	for _, delay in ipairs({ 0, 0.05, 0.2, 0.5 }) do
+		After(delay, function()
+			if CP.settings.ungroupRecipes then UI:EnsureUngrouped(reason) end
+		end)
+	end
+end
+
+function UI:SetUngroupRecipes(enabled)
+	CP.settings.ungroupRecipes = enabled and true or false
+	CP.touched.ungroupRecipes = true
+	self:RebuildList()
+	if enabled then
+		self:QueueEnsureUngrouped("toggle")
+	end
+	CP:Fire("UNGROUP_CHANGED", CP.settings.ungroupRecipes)
+end
+
+---------------------------------------------------------------------------
 -- Refresh
 ---------------------------------------------------------------------------
 
@@ -891,7 +1070,11 @@ function UI:RefreshAll()
 		if type(list.ScrollBox.GetDataProvider) == "function" then
 			local dataProvider = list.ScrollBox:GetDataProvider()
 			if CP.settings.profitableOnly then self:ApplyFilter(dataProvider) end
-			if CP.settings.sortByProfit then self:ApplySort(dataProvider) end
+			if CP.settings.ungroupRecipes then
+				self:QueueEnsureUngrouped("refresh")
+			elseif CP.settings.sortByProfit then
+				self:ApplySort(dataProvider)
+			end
 		end
 	end
 
@@ -940,9 +1123,15 @@ function UI:Setup()
 
 	hooksecurefunc(page.SchematicForm, "Init", OnFormInit)
 
-	hooksecurefunc(page.RecipeList.ScrollBox, "SetDataProvider", function(_, dataProvider)
+	hooksecurefunc(page.RecipeList.ScrollBox, "SetDataProvider", function(scroll, dataProvider)
+		if ungroupApplying then return end -- our own flat provider; do not recurse
 		UI:ApplyFilter(dataProvider)
-		UI:ApplySort(dataProvider)
+		if CP.settings.ungroupRecipes then
+			-- Do not flatten synchronously: Forever drops nested SetDataProvider calls.
+			UI:QueueEnsureUngrouped("provider")
+		elseif CP.settings.sortByProfit then
+			UI:ApplySort(dataProvider)
+		end
 	end)
 
 	if Menu and type(Menu.ModifyMenu) == "function" then
@@ -952,6 +1141,9 @@ function UI:Setup()
 			rootDescription:CreateCheckbox("Sort by profit",
 				function() return CP.settings.sortByProfit end,
 				function() UI:SetSortByProfit(not CP.settings.sortByProfit) end)
+			rootDescription:CreateCheckbox("Ungroup recipes",
+				function() return CP.settings.ungroupRecipes end,
+				function() UI:SetUngroupRecipes(not CP.settings.ungroupRecipes) end)
 			rootDescription:CreateCheckbox("Profitable only",
 				function() return CP.settings.profitableOnly end,
 				function() UI:SetProfitableOnly(not CP.settings.profitableOnly) end)
@@ -986,4 +1178,9 @@ CP:RegisterEvent("TRADE_SKILL_SHOW", function()
 		UI.warned = true
 		CP:Print("could not find the retail profession window (ProfessionsFrame). This client's profession UI is not supported yet.")
 	end
+	if CP.settings.ungroupRecipes then UI:QueueEnsureUngrouped("show") end
+end)
+
+CP:RegisterEvent("TRADE_SKILL_LIST_UPDATE", function()
+	if CP.settings.ungroupRecipes then UI:QueueEnsureUngrouped("list") end
 end)

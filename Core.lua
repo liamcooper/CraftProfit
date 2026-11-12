@@ -21,10 +21,12 @@ CP.defaults = {
 	rowTag = "profit",            -- what the recipe-row tag shows: profit | margin | both
 	netBasis = "ah",              -- which net the tags, sort and panel lead with: ah | vendor
 	trainerTags = true,           -- profit tags in the profession trainer window
+	missingTab = true,            -- side tab: unlearned recipes that would profit (needs ForeverMaster)
 	showReagentPrices = true,
 	showPanel = true,
 	sortByProfit = false,
 	profitableOnly = false,       -- hide recipes with a negative craft profit in the profession list
+	ungroupRecipes = false,       -- flatten category headers so every recipe sits in one list
 	craftIntermediates = false,   -- price reagents you can craft (learned recipe) at their own craft cost
 	craftOnlyWhenCheaper = true,  -- ...but only when that beats the buy price
 	scanButton = true,
@@ -919,11 +921,14 @@ local function PrintStatus()
 	if CP.Share then CP:Print(CP.Share:Status()) end
 	local crafts = 0
 	for _ in pairs(CP.crafts or {}) do crafts = crafts + 1 end
-	CP:Print("AH cut %d%%, sale basis %s, net shown %s, sort by profit %s, profitable only %s, craft intermediates %s (%d craftable items known), trainer tags %s.",
+	CP:Print("AH cut %d%%, sale basis %s, net shown %s, sort by profit %s, ungroup %s, profitable only %s, craft intermediates %s (%d craftable items known), trainer tags %s, missing tab %s%s.",
 		math.floor(CP.settings.ahCut * 100 + 0.5), CP.settings.saleBasis, CP.settings.netBasis or "ah",
-		CP.settings.sortByProfit and "on" or "off", CP.settings.profitableOnly and "on" or "off",
+		CP.settings.sortByProfit and "on" or "off", CP.settings.ungroupRecipes and "on" or "off",
+		CP.settings.profitableOnly and "on" or "off",
 		CP.settings.craftIntermediates and "on" or "off", crafts,
-		CP.settings.trainerTags and "on" or "off")
+		CP.settings.trainerTags and "on" or "off",
+		CP.settings.missingTab and "on" or "off",
+		(CP.Missing and CP.Missing:HasForeverMaster()) and "" or " (ForeverMaster not loaded)")
 end
 
 local function PrintHelp()
@@ -933,10 +938,12 @@ local function PrintHelp()
 	CP:Print("  /cf depth [on|off] - read your reagents' and outputs' listings now (on/off: after every full scan)")
 	CP:Print("  /cf source auto|craftprofit|auctionator|tsm")
 	CP:Print("  /cf sort - toggle sort recipes by profit")
+	CP:Print("  /cf ungroup - toggle flat recipe list (no category headers, sorted by profit)")
 	CP:Print("  /cf profit - toggle listing only profitable crafts")
 	CP:Print("  /cf tag profit|margin|both - what the recipe rows show")
 	CP:Print("  /cf net ah|vendor - show profit for selling on the AH or to a vendor")
 	CP:Print("  /cf trainer - toggle profit tags in the profession trainer window (/cf trainer check lists what each service matched)")
+	CP:Print("  /cf missing - list missing profitable recipes (needs ForeverMaster; also a side tab on the profession window)")
 	CP:Print("  /cf craft - toggle pricing craftable reagents at their own craft cost")
 	CP:Print("  /cf cut <percent> - auction house cut used for net profit")
 	CP:Print("  /cf basis min|market - sale price basis for own scans (market = depth value)")
@@ -980,6 +987,9 @@ local function HandleSlash(input)
 	elseif cmd == "sort" then
 		CP.UI:SetSortByProfit(not CP.settings.sortByProfit)
 		CP:Print("sort by profit %s", CP.settings.sortByProfit and "on" or "off")
+	elseif cmd == "ungroup" then
+		CP.UI:SetUngroupRecipes(not CP.settings.ungroupRecipes)
+		CP:Print("ungroup recipes %s", CP.settings.ungroupRecipes and "on" or "off")
 	elseif cmd == "profit" then
 		CP.UI:SetProfitableOnly(not CP.settings.profitableOnly)
 		CP:Print("profitable only %s", CP.settings.profitableOnly and "on" or "off")
@@ -1005,6 +1015,17 @@ local function HandleSlash(input)
 		else
 			CP:SetSetting("trainerTags", not CP.settings.trainerTags)
 			CP:Print("trainer profit tags %s", CP.settings.trainerTags and "on" or "off")
+		end
+	elseif cmd == "missing" then
+		if rest:lower() == "off" or rest:lower() == "on" then
+			CP:SetSetting("missingTab", rest:lower() == "on")
+			CP:Print("missing recipes tab %s", CP.settings.missingTab and "on" or "off")
+		elseif CP.Missing then
+			if ProfessionsFrame and ProfessionsFrame:IsShown() and CP.settings.missingTab then
+				CP.Missing:Setup()
+				CP.Missing:ShowPage()
+			end
+			CP.Missing:Report()
 		end
 	elseif cmd == "craft" then
 		CP:SetSetting("craftIntermediates", not CP.settings.craftIntermediates)
