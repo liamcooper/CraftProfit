@@ -1,34 +1,42 @@
--- CraftProfit :: Share
--- Account-wide price cache carried in registered CVars, so a scan on one character is visible on every
--- other character of the account. Why: on the WoW Forever beta the account-wide SavedVariables file is not
--- reliably handed back to addons, and a character that starts empty then overwrites the account file with an
--- empty database at logout.
--- CVars registered with C_CVar.RegisterCVar live for the whole client process (character switches
--- included) and are written to WTF/Config.wtf at exit, which gives us an account-wide channel that does
--- not go through the SavedVariables loader.
+-- CraftProfit :: Share (retired; import only)
+-- Up to 0.5.0 CraftProfit also copied its price cache into registered CVars (CraftProfitShare1..N plus
+-- CraftProfitShareMeta, saved by the client in WTF/Config.wtf), because the WoW Forever beta did not hand the
+-- account-wide SavedVariables back to addons. SavedVariables load again, so the CVars are no longer written: some
+-- clients refuse addon CVar values altogether, which printed "shared price cache could not be written" after
+-- every scan.
+-- What is left: once per account database, whatever an older version left in the CVars is merged in (only prices
+-- newer than the local record, vendor prices only where none is known; nothing local is overwritten or removed),
+-- and the import is recorded in CraftProfitDB.shareImported so it never runs again. The CVars themselves are left
+-- as they are (inert); /cf reset empties them.
 --
--- Payload: one string, base-36 numbers, split over CraftProfitShare1..N (chunk size adapts if the client
--- truncates CVar values), plus CraftProfitShareMeta = "version|chunks|length|writtenAt|by".
+-- Payload (read only): one string, base-36 numbers, split over CraftProfitShare1..N,
+-- plus CraftProfitShareMeta = "version|chunks|length|writtenAt|by".
 --   V:<id.price;...>                              learned vendor prices
---   R:<realmKey>:<lastScan>:<id.price.qty[.age];...>  one section per realm, current realm first; age =
---                                                 minutes the price is older than lastScan (omitted when 0)
--- Pull merges shared prices whose scan is newer than the local record; Push writes the whole realm price
--- table (not only the "touched" items the SavedVariables pack keeps) within the size budget.
+--   R:<realmKey>:<lastScan>:<id.price.qty[.age];...>  one section per realm; age = minutes the price is older
+--                                                 than lastScan (omitted when 0)
 
 local _, CP = ...
-local Share = { chunkSize = 1000, maxChunks = 24, minChunk = 200, status = "not initialised" }
+local Share = { maxChunks = 24, status = "not checked yet" }
 CP.Share = Share
 
 local PREFIX = "CraftProfitShare"
 local META = PREFIX .. "Meta"
 local VERSION = 1
-local PROBE = "cpok" -- short alphanumeric; Forever has failed even 200-char round-trips
 
 local function Available()
 	return C_CVar ~= nil and type(C_CVar.RegisterCVar) == "function"
 		and type(C_CVar.SetCVar) == "function" and type(C_CVar.GetCVar) == "function"
 end
 Share.Available = Available
+
+local registered = false
+function Share:Register()
+	if registered or not Available() then return registered end
+	pcall(C_CVar.RegisterCVar, META, "")
+	for i = 1, self.maxChunks do pcall(C_CVar.RegisterCVar, PREFIX .. i, "") end
+	registered = true
+	return true
+end
 
 local function Get(name)
 	local ok, v = pcall(C_CVar.GetCVar, name)
@@ -45,67 +53,16 @@ local function Clean(name)
 	return (tostring(name or ""):gsub("[^%w]", ""))
 end
 
--- nil = not probed yet; true/false = this client can/cannot round-trip addon CVar strings.
-local usable = nil
-
-local function MarkUnusable(why)
-	usable = false
-	Share.status = why or "unavailable (CVar values do not round-trip on this client)"
-	CP:Debug("share: %s", Share.status)
-end
-
--- One cheap Set/Get on chunk 1. If that fails, Push would only spam chat every scan.
-local function Probe()
-	if usable ~= nil then return usable end
-	if not Available() then
-		MarkUnusable("unavailable (C_CVar.RegisterCVar / SetCVar / GetCVar missing)")
-		return false
-	end
-	local name = PREFIX .. "1"
-	local previous = Get(name) or ""
-	if not Set(name, PROBE) or Get(name) ~= PROBE then
-		pcall(Set, name, previous)
-		MarkUnusable("unavailable (CVar values do not round-trip on this client; using local SavedVariables only)")
-		return false
-	end
-	-- Restore whatever was there so we do not wipe a good cache during login probe.
-	if previous ~= PROBE then Set(name, previous) end
-	usable = true
-	return true
-end
-
-function Share:Usable()
-	if not Available() then return false end
-	if usable == nil then
-		self:Register()
-	end
-	return usable == true
-end
-
-local registered = false
-function Share:Register()
-	if not Available() then
-		MarkUnusable("unavailable (C_CVar.RegisterCVar / SetCVar / GetCVar missing)")
-		return false
-	end
-	if not registered then
-		pcall(C_CVar.RegisterCVar, META, "")
-		for i = 1, self.maxChunks do pcall(C_CVar.RegisterCVar, PREFIX .. i, "") end
-		registered = true
-	end
-	Probe()
-	return usable == true
-end
-
 ---------------------------------------------------------------------------
 -- Encoding
 ---------------------------------------------------------------------------
 
--- Returns the payload string and { prices, realms, dropped }.
+-- Builds a payload in the old format. Not used by the addon any more; the test harness uses it to fake the
+-- CVars an older version left behind. Returns the payload string and { prices, realms, dropped }.
 function Share:Encode(db, budget)
 	db = db or CP.db
 	local Enc = CP.Enc
-	budget = budget or (self.chunkSize * self.maxChunks)
+	budget = budget or (1000 * self.maxChunks)
 	local now = time()
 	local parts = { tostring(VERSION), Enc(now), Clean(UnitName and UnitName("player") or "") }
 	local total = #table.concat(parts, "|")
@@ -200,66 +157,20 @@ function Share:Decode(s)
 end
 
 ---------------------------------------------------------------------------
--- Push / pull
+-- Import
 ---------------------------------------------------------------------------
-
--- Writes the shared cache. Returns prices written (or nil) and an info table.
-function Share:Push(reason)
-	if not self:Register() then
-		self.lastPush = { at = time(), reason = reason, ok = false, skipped = true }
-		-- Quiet: Forever often cannot round-trip addon CVars; local SavedVariables still hold prices.
-		return nil, self.lastPush
-	end
-	local attempts = 0
-	while true do
-		attempts = attempts + 1
-		local payload, stats = self:Encode(CP.db, self.chunkSize * self.maxChunks)
-		local chunks = {}
-		for pos = 1, #payload, self.chunkSize do
-			chunks[#chunks + 1] = payload:sub(pos, pos + self.chunkSize - 1)
-		end
-		local ok = true
-		for i, chunk in ipairs(chunks) do
-			if not Set(PREFIX .. i, chunk) or Get(PREFIX .. i) ~= chunk then
-				ok = false
-				break
-			end
-		end
-		if ok then
-			for i = #chunks + 1, self.maxChunks do
-				if (Get(PREFIX .. i) or "") ~= "" then Set(PREFIX .. i, "") end
-			end
-			local meta = table.concat({ VERSION, #chunks, #payload, CP.Enc(time()), Clean(UnitName and UnitName("player") or "") }, "|")
-			Set(META, meta)
-			self.lastPush = { at = time(), reason = reason, chunks = #chunks, length = #payload, prices = stats.prices,
-				realms = stats.realms, dropped = stats.dropped, chunkSize = self.chunkSize, ok = true }
-			self.status = string.format("pushed %d prices (%d realm%s) in %d chunk%s, %.1f KB%s", stats.prices, stats.realms,
-				stats.realms == 1 and "" or "s", #chunks, #chunks == 1 and "" or "s", #payload / 1024,
-				stats.dropped > 0 and string.format(", %d dropped for size", stats.dropped) or "")
-			CP:Debug("share push (%s): %s", tostring(reason), self.status)
-			return stats.prices, self.lastPush
-		end
-		-- the client truncated or refused the value: try smaller chunks
-		if self.chunkSize <= self.minChunk or attempts >= 8 then
-			MarkUnusable(string.format(
-				"unavailable (CVar values do not round-trip even at %d characters; using local SavedVariables only)",
-				self.chunkSize))
-			self.lastPush = { at = time(), reason = reason, ok = false, chunkSize = self.chunkSize }
-			return nil, self.lastPush
-		end
-		self.chunkSize = math.max(self.minChunk, math.floor(self.chunkSize / 2))
-	end
-end
 
 -- Reads the shared cache and merges newer prices into the database. Returns the number of prices merged.
 function Share:Pull(reason)
-	if not self:Register() then
+	if not Available() then
+		self.status = "unavailable (C_CVar.RegisterCVar / SetCVar / GetCVar missing)"
 		return 0
 	end
+	self:Register()
 	local meta = Get(META)
 	if not meta or meta == "" then
 		self.lastPull = { at = time(), reason = reason, found = false }
-		if not self.lastPush then self.status = "no shared data yet (scan on any character to fill it)" end
+		self.status = "no old cache found"
 		return 0
 	end
 	local version, n, len = meta:match("^(%d+)|(%d+)|(%d+)")
@@ -325,40 +236,59 @@ function Share:Pull(reason)
 	return merged
 end
 
--- Empties the shared cache (used by /cf reset so the wiped prices do not come back at the next pull).
+-- Merges the old CVar cache into the database once per account database (force: again, for /cf share import).
+-- Returns the number of prices merged.
+function Share:Import(reason, force)
+	local db = CP.db
+	if not db then return 0 end
+	if db.shareImported and not force then
+		self.status = "already imported"
+		return 0
+	end
+	local merged = 0
+	self.lastPull = nil
+	if Available() then
+		local ok, n = pcall(self.Pull, self, reason)
+		if ok then merged = n or 0 else self.status = "import failed: " .. tostring(n) end
+	else
+		self.status = "nothing to import (C_CVar unavailable)"
+	end
+	local pull = self.lastPull or {}
+	db.shareImported = { at = time(), merged = merged, found = pull.found and true or false,
+		ok = pull.ok and true or false, writtenAt = pull.writtenAt }
+	if merged > 0 then
+		CP:Print("imported %d price%s from the old cross-character cache (now carried by saved data).", merged, merged == 1 and "" or "s")
+	end
+	return merged
+end
+
+-- Empties the old cache (used by /cf reset).
 function Share:Clear()
-	if not self:Usable() then return end
+	if not Available() then return end
+	self:Register()
 	Set(META, "")
 	for i = 1, self.maxChunks do Set(PREFIX .. i, "") end
-	self.lastPush = nil
 	self.status = "cleared"
 end
 
 function Share:Status()
-	if not Available() then
-		return "Shared price cache: unavailable on this client (C_CVar.RegisterCVar missing)."
-	end
-	if usable == false then
-		return "Shared price cache: " .. tostring(self.status) .. "."
-	end
-	local s = "Shared price cache (account-wide CVars): " .. tostring(self.status) .. "."
-	if self.lastPush and self.lastPush.ok then
-		s = s .. string.format(" Last push %s (%s).", CP:FormatAge(time() - self.lastPush.at), tostring(self.lastPush.reason))
+	local s = "Cross-character prices: carried by saved data (the old CVar cache is no longer written)."
+	local imp = CP.db and CP.db.shareImported
+	if imp then
+		if imp.found and imp.ok then
+			s = s .. string.format(" Old cache imported %s: %d prices merged.", CP:FormatAge(time() - (imp.at or time())), imp.merged or 0)
+		elseif imp.found then
+			s = s .. " Old cache found but unreadable; nothing imported (" .. tostring(self.status) .. ")."
+		else
+			s = s .. " No old cache to import."
+		end
 	end
 	return s
 end
 
-function Share:OnLogout()
-	if not self:Usable() then return end
-	pcall(self.Pull, self, "logout")
-	pcall(self.Push, self, "logout")
-end
+-- Kept so older call sites stay harmless: nothing is written at logout any more.
+function Share:OnLogout() end
 
-CP:On("READY", function()
-	Share:Register()
-	if Share:Usable() then Share:Pull("login") end
-end)
-CP:On("DB_ADOPTED", function()
-	if Share:Usable() then Share:Pull("adopted") end
-end)
-CP:On("SCAN_FINISHED", function() Share:Push("scan") end)
+CP:On("READY", function() Share:Import("login") end)
+-- a late-arriving saved file carries its own shareImported record; if it has none, import into it
+CP:On("DB_ADOPTED", function() Share:Import("adopted") end)

@@ -7,17 +7,45 @@
   Forever recipe catalog for trainer and Plans/Pattern recipes of the professions you have. Hover a
   row for cost, both nets and the recipe source (trainer or recipe item). Toggle with options or
   `/cf missing on|off`.
-- **Profitable only**: a Filter menu / options / `/cf profit` toggle that hides recipes whose craft
-  profit is negative. Recipes with missing prices stay visible; empty categories are culled from the list.
 - **Ungroup recipes**: Filter menu / options / `/cf ungroup` drops category headers and shows one flat
   list sorted by profit, so the best craft is at the top instead of buried under Everyday Meals / Stamina Food.
 - Fix: Ungroup + Profitable only no longer recurse through `OpenRecipe` → `SetDataProvider` until
   `TreeListDataProvider` hits a C stack overflow.
 - Fix: the missing-recipes tab no longer prints `missing profitable: N of M…` to chat on every
   craft while the tab is open (status line only; `/cf missing` still reports in chat).
-- Fix: when Forever cannot round-trip addon CVars, the shared price cache disables itself quietly
-  (no `push FAILED` chat after every scan). Prices stay in local SavedVariables; `/cf status` still
-  shows why Share is off.
+
+## 0.5.2
+
+- Shopping list: when you open the Auction House buy page for a reagent the list still needs, the quantity is
+  filled in with how many you are missing. Items that are sold one per auction have no quantity box and are
+  left as they are.
+- Fixed: buying one item from a grouped Auction House row (for example 1 of 860 Copper Rods) counted the whole
+  row as bought. CraftProfit now records what you paid for, so the shopping list shows 1 in the mail.
+- The shopping list's button on the Auction House is now a small **Shop** button, so it no longer covers the
+  AH's own bid and buyout boxes.
+
+## 0.5.1
+
+- **Profitable only**: a Filter menu / options / `/cf profit` toggle that hides recipes whose craft
+  profit is negative, zero or unknown (a missing price). Empty categories are removed from the list.
+- **Shopping list**: **Shop** in the profit panel adds the selected recipe, times the craft count next to
+  Create (right-click takes it off). At the Auction House a panel beside the window lists every reagent you
+  still need after what's in your bags and bank, with the cost at the scanned prices. What you buy at the AH
+  counts right away as "in the mail" until you collect it. **Search all** puts every missing reagent into the
+  Auction House results in one search; click an item to search just that one. Vendor reagents are listed but
+  not searched. The list is shared by all your characters. `/cf shop` and `/cf shop clear`.
+- Hold **Shift** over a stack in your bags and the tooltip shows every price for the whole stack (20 Light
+  Leather: the auction price for all 20). Without Shift it shows the price per item and a "Stack of 20" hint.
+- Item tooltips no longer show the CraftProfit block on items that can't go to the Auction House: quest
+  items, bind-on-pickup items, and anything already Soulbound or Warbound (for example a BoE you equipped).
+- The profit panel no longer overlaps other addons in the recipe details. It now goes below whatever is
+  actually under the reagents (ForeverRecipes' Difficulty and Source rows, Auctionator's reagent total) and
+  follows ForeverRecipes' two-per-row reagent layout. When space is tight it shrinks to the Net profit row.
+- Fixed "shared price cache could not be written (push FAILED ...)" after every scan on some clients. Prices
+  reach your other characters through the normal saved data again, so CraftProfit no longer writes its old
+  extra copy into the game's console settings (CVars). Nothing is lost when updating: whatever that old copy
+  still holds is merged in once at login (only prices newer than your own; nothing of yours is overwritten).
+- `/cf share` shows whether that old copy was imported; `/cf share import` merges it again.
 
 ## 0.5.0
 

@@ -4,7 +4,7 @@
 --   * unit price / line total under every reagent
 --   * "Profit - Auction House" (or "- Vendor", per the netBasis setting) panel in the recipe details
 --   * optional sort-by-profit within categories (Filter dropdown, panel checkbox, /cf sort); see "Sort by profit"
---   * optional profitable-only filter (Filter dropdown, /cf profit); see "Profitable only"
+--   * optional profitable-only filter (Filter dropdown, options, /cf profit); see "Profitable only"
 --   * optional ungroup (Filter dropdown, /cf ungroup): drop category headers and sort one flat list
 
 local _, CP = ...
@@ -282,7 +282,128 @@ local function PanelRightInset(form)
 	return PANEL_INSET
 end
 
+-- Other addons put their own rows under the reagents (Auctionator's reagent total, ForeverRecipes'
+-- Difficulty block and Source tabs) and ForeverRecipes lays the reagents out two per row. So once the form
+-- is laid out, the panel goes below whatever is actually there instead of assuming Blizzard's layout.
+local PANEL_MIN_HEIGHT = 62     -- title + net row: the smallest panel that still says something
+local PANEL_FLOOR = 8           -- how far the smallest panel may dip into the Track Recipe band
+local SETTLE_TIME = 0.5         -- neighbours (ForeverRecipes) place their rows a frame or more after us
+
+-- Screen-space rect (scale-normalised), or nil when the region is not laid out yet.
+local function Rect(f)
+	if not (f and type(f.GetTop) == "function" and type(f.GetBottom) == "function") then return nil end
+	local top, bottom = f:GetTop(), f:GetBottom()
+	if type(top) ~= "number" or type(bottom) ~= "number" then return nil end
+	local left = type(f.GetLeft) == "function" and f:GetLeft() or nil
+	local right = type(f.GetRight) == "function" and f:GetRight() or nil
+	local s = type(f.GetEffectiveScale) == "function" and f:GetEffectiveScale() or 1
+	return { top = top * s, bottom = bottom * s, left = left and left * s, right = right and right * s, scale = s }
+end
+
+local function Visible(f)
+	if type(f.IsShown) == "function" and not f:IsShown() then return false end
+	if type(f.IsVisible) == "function" and not f:IsVisible() then return false end
+	if type(f.GetAlpha) == "function" and (f:GetAlpha() or 1) <= 0.01 then return false end
+	return true
+end
+
+-- Lowest screen y of everything in the reagent area and below it (reagent slots, Blizzard's optional
+-- reagents, and any other addon's frame on the form or its page that sits inside the form's width), or nil
+-- when nothing can be measured yet. Returns the form's rect too.
+local function ContentBottom(p, form)
+	local fr = Rect(form)
+	if not (fr and fr.left and fr.right) then return nil end
+	local lowest, reagentTop
+	for _, slot in ipairs(BasicSlots(form)) do
+		local r = Visible(slot) and Rect(slot)
+		if r then
+			if not lowest or r.bottom < lowest then lowest = r.bottom end
+			if not reagentTop or r.top > reagentTop then reagentTop = r.top end
+		end
+	end
+	if not lowest then return nil end
+	local optional = form.OptionalReagents
+	local r = optional and Visible(optional) and Rect(optional)
+	if r and r.bottom < lowest then lowest = r.bottom end
+
+	local formHeight = fr.top - fr.bottom
+	local band = fr.bottom + PANEL_BOTTOM * fr.scale -- the Track Recipe row: not content
+	local skip = { [p] = true, [form] = true, [form.Reagents or p] = true, [optional or p] = true }
+	local function scan(parent)
+		if not (parent and type(parent.GetChildren) == "function") then return end
+		for _, child in ipairs({ parent:GetChildren() }) do
+			if not skip[child] and Visible(child) then
+				local c = Rect(child)
+				if c and c.left and c.right and c.top - c.bottom > 1
+					and c.top - c.bottom <= formHeight * 0.6           -- not a backdrop / whole-form container
+					and c.left >= fr.left - 4 and c.right <= fr.right + 4 -- inside the recipe pane
+					and c.top <= reagentTop + 2 and c.top > band       -- in the space the panel would use
+					and c.bottom < lowest then
+					lowest = c.bottom
+				end
+			end
+		end
+	end
+	scan(form)
+	scan(type(form.GetParent) == "function" and form:GetParent() or nil)
+	return lowest, fr
+end
+
+-- Puts panel `p` (a child of `form`) below everything in the reagent area, at most `designHeight` tall.
+-- Returns false when the form is not laid out yet (the caller then uses its own fallback). Shared with
+-- companion addons as UI.PlaceBelowContent.
+local function PlaceBelowContent(p, form, designHeight)
+	local lowest, fr = ContentBottom(p, form)
+	if lowest then
+		local s = fr.scale
+		local offset = (fr.top - lowest) / s + PANEL_GAP
+		local room = (fr.top - fr.bottom) / s - offset - PANEL_BOTTOM
+		local height = math.min(designHeight or PANEL_HEIGHT, room)
+		if height < PANEL_MIN_HEIGHT then
+			height = math.min(PANEL_MIN_HEIGHT, room + PANEL_BOTTOM - PANEL_FLOOR)
+		end
+		height = math.floor(height + 0.5)
+		if p.cpGeometry and math.abs(p.cpGeometry.offset - offset) < 0.5 and p.cpGeometry.height == height then
+			return true -- already there; avoid re-anchoring every frame while settling
+		end
+		p.cpGeometry = { offset = offset, height = height }
+		p:ClearAllPoints()
+		p:SetPoint("TOPLEFT", form, "TOPLEFT", PANEL_INSET, -offset)
+		p:SetPoint("RIGHT", form, "RIGHT", -PanelRightInset(form), 0)
+		p:SetHeight(height)
+		return true
+	end
+	p.cpGeometry = nil
+	return false
+end
+UI.PlaceBelowContent = PlaceBelowContent
+
+-- Re-check the placement for a short while after a recipe is shown: other addons place their rows after
+-- the form's Init (ForeverRecipes on the next frame, and again on its own refreshes). `anchor(p, form)` is
+-- the panel's own placement function. Shared with companion addons as UI.SettlePanel.
+local function SettlePanel(p, form, anchor)
+	p.cpSettleUntil = GetTime() + SETTLE_TIME
+	p.cpSettleAnchor = anchor
+	if p.cpSettling then return end
+	p.cpSettling = true
+	p:SetScript("OnUpdate", function(self)
+		if not self:IsShown() or GetTime() > (self.cpSettleUntil or 0) then
+			self.cpSettling = false
+			self:SetScript("OnUpdate", nil)
+			return
+		end
+		self.cpSettleAnchor(self, form)
+	end)
+end
+UI.SettlePanel = SettlePanel
+
 local function AnchorPanel(p, form)
+	if PlaceBelowContent(p, form, PANEL_HEIGHT) then
+		p.cpStretch = false
+		p.cpAnchor = nil
+		return
+	end
+
 	local slots = BasicSlots(form)
 	local anchor
 	if #slots > 0 then
@@ -377,7 +498,10 @@ local function CreatePanel(form)
 	-- final form width, so on first open we measure the retail default. Re-anchor whenever the form resizes.
 	if type(form.HookScript) == "function" then
 		form:HookScript("OnSizeChanged", function(f)
-			if f.cpPanel and f.cpPanel:IsShown() then AnchorPanel(f.cpPanel, f) end
+			if f.cpPanel and f.cpPanel:IsShown() then
+				f.cpPanel.cpGeometry = nil
+				AnchorPanel(f.cpPanel, f)
+			end
 		end)
 	end
 	p:SetScript("OnSizeChanged", function(self) LayoutPanel(self) end)
@@ -399,9 +523,19 @@ local function CreatePanel(form)
 
 	-- Scan age (and the source when it is not our own scan) on the header's right side. Anchored to
 	-- both the title and the right edge so it clips instead of overlapping the title when narrow.
+	-- "Shop": adds this recipe (times Blizzard's craft count) to the AH shopping list (Shopping.lua).
+	p.ShopButton = CreateFrame("Button", nil, p, "UIPanelButtonTemplate")
+	p.ShopButton:SetSize(44, 18)
+	p.ShopButton:SetPoint("TOPRIGHT", p, "TOPRIGHT", -6, -5)
+	p.ShopButton:SetText("Shop")
+	if p.ShopButton.RegisterForClicks then p.ShopButton:RegisterForClicks("LeftButtonUp", "RightButtonUp") end
+	p.ShopButton:SetScript("OnClick", function(self, button) UI:ShopClicked(self, button) end)
+	p.ShopButton:SetScript("OnEnter", function(self) UI:ShopTooltip(self) end)
+	p.ShopButton:SetScript("OnLeave", GameTooltip_Hide)
+
 	p.Age = p:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
 	p.Age:SetPoint("LEFT", p.Title, "RIGHT", 8, -1)
-	p.Age:SetPoint("RIGHT", p, "RIGHT", -10, 0)
+	p.Age:SetPoint("RIGHT", p.ShopButton, "LEFT", -6, 0)
 	p.Age:SetJustifyH("RIGHT")
 	if p.Age.SetWordWrap then p.Age:SetWordWrap(false) end
 	if p.Age.SetMaxLines then p.Age:SetMaxLines(1) end
@@ -550,6 +684,51 @@ local function CreatePanel(form)
 	return p
 end
 
+-- How many crafts "Shop" adds: Blizzard's craft-count box under the recipe, at least 1.
+local function CraftCount()
+	local page = ProfessionsFrame and ProfessionsFrame.CraftingPage
+	local box = page and page.CreateMultipleInputBox
+	local n = box and type(box.GetValue) == "function" and tonumber(box:GetValue())
+	if not n or n < 1 then n = 1 end
+	return math.floor(n)
+end
+
+function UI:ShopClicked(button, mouse)
+	local p = button:GetParent()
+	local info = p and p.cpRecipeInfo
+	local shop = CP.Shopping
+	if not (info and info.recipeID and shop) then return end
+	local name = info.name or ("Recipe " .. info.recipeID)
+	if mouse == "RightButton" then
+		if shop:Crafts(info.recipeID) > 0 then
+			shop:Remove(info.recipeID)
+			CP:Print("%s taken off the shopping list.", name)
+		end
+	else
+		local crafts = CraftCount()
+		local total = shop:Add(info.recipeID, crafts, name)
+		CP:Print("Shopping list: %s x%d%s. Open the Auction House to buy the reagents.", name, total,
+			total > crafts and string.format(" (+%d)", crafts) or "")
+	end
+	if type(GameTooltip.IsOwned) == "function" and GameTooltip:IsOwned(button) then self:ShopTooltip(button) end
+end
+
+function UI:ShopTooltip(button)
+	local p = button:GetParent()
+	local info = p and p.cpRecipeInfo
+	GameTooltip:SetOwner(button, "ANCHOR_RIGHT")
+	GameTooltip:AddLine("Add to shopping list")
+	local n = CraftCount()
+	GameTooltip:AddLine(string.format("Adds %d craft%s of this recipe. At the Auction House, CraftProfit lists the reagents you still need and searches for them.",
+		n, n == 1 and "" or "s"), 1, 1, 1, true)
+	local have = info and CP.Shopping and CP.Shopping:Crafts(info.recipeID) or 0
+	if have > 0 then
+		GameTooltip:AddLine(string.format("On the list: %d crafts. Right-click to take it off.", have), 1, 0.82, 0, true)
+	end
+	GameTooltip:AddLine("Set the craft count in the box next to Create.", 0.6, 0.6, 0.6, true)
+	GameTooltip:Show()
+end
+
 -- The economics of the recipe shown in the open profession window, or nil.
 function UI:CurrentEco()
 	local frame = ProfessionsFrame
@@ -602,9 +781,12 @@ function UI:UpdateDetail(form, recipeInfo)
 
 	local eco = CP.Calc:Get(recipeInfo.recipeID)
 	p.cpEco = eco
+	p.cpRecipeInfo = recipeInfo
+	p.cpGeometry = nil -- new recipe: measure again
 	AnchorPanel(p, form)
 	LayoutPanel(p)
 	p:Show()
+	SettlePanel(p, form, AnchorPanel)
 
 	local ageText = eco.age and ("scanned " .. CP:FormatAge(eco.age)) or "no price data"
 	local source = CP.Sources:Resolve()
@@ -806,12 +988,22 @@ end
 -- Profitable only
 ---------------------------------------------------------------------------
 
--- Removes recipe rows whose current net is negative from the tree Blizzard just built.
--- Recipes with no price (nil net) stay; only known losses are dropped. Empty categories are
--- culled afterwards so headers without remaining crafts do not linger. Turning the filter off
--- (or changing Blizzard's own filters) rebuilds the list through Init, which restores everything.
+-- Shows only recipes with a known net above zero (the one the row tag shows):
+--   * Recipe rows that lose or break even are hidden, and so are recipes without a net (a reagent or the
+--     output has no price, or nothing sellable is made): an unknown result is not shown as profitable.
+--   * Rows are taken out of the list Blizzard built with the tree's own node:Remove (no invalidation per
+--     node; the provider is invalidated once at the end). A category left without recipes also loses its
+--     padding rows; a category left with nothing loses its header; the unlearned divider goes when no
+--     unlearned category is left. Only what this filter emptied is removed, never anything Blizzard kept.
+--   * The removed nodes are remembered for the list on screen and put back first on every pass (the same node
+--     objects, so children and collapse state survive). So new prices, the AH / vendor basis, an override
+--     and turning the filter off all work on the list that is on screen.
+--   * We never call Blizzard's page or list Init (see "Sort by profit").
 
-local rebuildingList = false
+-- Only the list on screen is remembered: Blizzard builds a new provider for every rebuild and drops the old
+-- one, so state for an older provider is simply forgotten (a weak table would not free it: the nodes point
+-- back at their provider).
+local hiddenFor, hiddenList -- data provider, { { parent, node, index }, ... }
 
 -- Rebuild the recipe ScrollBox from Blizzard's grouped tree. page:Init is often a no-op while the
 -- same profession stays open (so Filter toggles did nothing after the first apply); regenerating
@@ -840,57 +1032,104 @@ function UI:RebuildList()
 	end)
 	rebuildingList = false
 	if not ok then CP:Debug("list rebuild failed: %s", tostring(err)) end
+
+-- Puts every node the filter took out of `dataProvider` back. Returns the nodes that were hidden (a set) or nil.
+local function RestoreHidden(dataProvider)
+	local hidden = hiddenFor == dataProvider and hiddenList or nil
+	hiddenFor, hiddenList = nil, nil
+	if not hidden then return nil end
+	local was, parents = {}, {}
+	for i = #hidden, 1, -1 do -- reverse order: a header goes back before the rows that were taken out of it
+		local h = hidden[i]
+		local nodes = h.parent:GetNodes()
+		table.insert(nodes, math.min(h.index, #nodes + 1), h.node)
+		parents[h.parent] = true
+		was[h.node] = true
+	end
+	-- The parent's own comparator (Blizzard's, or ours while sorting by profit) puts them back in place.
+	for parent in pairs(parents) do
+		if parent.sortComparator then table.sort(parent:GetNodes(), parent.sortComparator) end
+	end
+	return was
 end
 
-local function CategoryHasContent(node)
+local function FilteredOut(data)
+	local net = UI:GetNet(data.recipeInfo.recipeID)
+	return net == nil or net <= 0
+end
+
+local function Hide(parent, child, hidden)
+	for index, n in ipairs(parent:GetNodes()) do
+		if n == child then
+			parent:Remove(child, true) -- TreeNodeMixin:Remove(node, skipInvalidation)
+			hidden[#hidden + 1] = { parent = parent, node = child, index = index }
+			return
+		end
+	end
+end
+
+-- Hides the losing recipes under `node` (the root or a category), depth first. Returns whether the node still
+-- shows a recipe, and whether this filter removed anything below it.
+local function FilterNode(node, hidden)
+	local drop, paddings = {}, {}
+	local hasRecipe, hasCategory, removed = false, false, false
 	for _, child in ipairs(node:GetNodes() or {}) do
 		local d = NodeData(child)
-		if d and d.recipeInfo then return true end
-		if d and d.categoryInfo and CategoryHasContent(child) then return true end
+		if d and d.categoryInfo then
+			local shows, sub = FilterNode(child, hidden)
+			removed = removed or sub
+			if shows or not sub then hasCategory = true else drop[#drop + 1] = child end
+		elseif d and d.recipeInfo and d.recipeInfo.recipeID then
+			if FilteredOut(d) then drop[#drop + 1] = child else hasRecipe = true end
+		elseif d and (d.topPadding or d.bottomPadding) then
+			paddings[#paddings + 1] = child
+		end
 	end
-	return false
+	if #drop > 0 then removed = true end
+	if removed and not hasRecipe then
+		for _, p in ipairs(paddings) do drop[#drop + 1] = p end
+	end
+	for _, child in ipairs(drop) do Hide(node, child, hidden) end
+	return hasRecipe or hasCategory, removed
 end
 
--- Drops negative-profit recipes (and then empty categories) from a recipe list data provider.
+-- Applies (or removes) the filter on a recipe list data provider. Returns true when the visible rows changed.
 function UI:ApplyFilter(dataProvider)
-	if not dataProvider or not CP.settings.profitableOnly then return false end
-	if type(dataProvider.EnumerateEntireRange) ~= "function" or type(dataProvider.Remove) ~= "function" then
-		return false
-	end
+	if not dataProvider then return false end
+	local want = CP.settings.profitableOnly and true or false
+	if not want and hiddenFor ~= dataProvider then return false end
+	if type(dataProvider.GetRootNode) ~= "function" then return false end
 	local changed = false
 	local ok, err = pcall(function()
-		local drop = {}
-		for _, node in dataProvider:EnumerateEntireRange() do
-			local d = NodeData(node)
-			local info = d and d.recipeInfo
-			if info and info.recipeID and not d.categoryInfo then
-				local net = UI:GetNet(info.recipeID)
-				if net ~= nil and net < 0 then
-					table.insert(drop, node)
+		local was = RestoreHidden(dataProvider)
+		local hidden = {}
+		if want then
+			hiddenFor, hiddenList = dataProvider, hidden -- recorded as we go, so an error cannot lose rows
+			local root = dataProvider:GetRootNode()
+			local _, removed = FilterNode(root, hidden)
+			-- the unlearned divider only makes sense above an unlearned category
+			if removed then
+				local divider, unlearned
+				for _, child in ipairs(root:GetNodes() or {}) do
+					local d = NodeData(child)
+					if d and d.isDivider then divider = child end
+					if d and d.categoryInfo and d.categoryInfo.unlearned then unlearned = true end
 				end
+				if divider and not unlearned then Hide(root, divider, hidden) end
 			end
 		end
-		for _, node in ipairs(drop) do
-			dataProvider:Remove(node)
-			changed = true
-		end
-		-- Cull categories that no longer hold a recipe (or a non-empty subcategory).
-		local again = true
-		while again do
-			again = false
-			local empty = {}
-			for _, node in dataProvider:EnumerateEntireRange() do
-				local d = NodeData(node)
-				if d and d.categoryInfo and not CategoryHasContent(node) then
-					table.insert(empty, node)
-				end
-			end
-			for _, node in ipairs(empty) do
-				dataProvider:Remove(node)
-				changed = true
-				again = true
+		if #hidden == 0 then hiddenFor, hiddenList = nil, nil end
+		-- changed unless exactly the same rows were hidden again
+		local same = (was ~= nil) == (#hidden > 0)
+		if same and was then
+			local n = 0
+			for _ in pairs(was) do n = n + 1 end
+			same = n == #hidden
+			for _, h in ipairs(hidden) do
+				if not was[h.node] then same = false break end
 			end
 		end
+		changed = not same
 	end)
 	if not ok then CP:Debug("filter failed: %s", tostring(err)) end
 	if changed and type(dataProvider.Invalidate) == "function" then
@@ -900,11 +1139,31 @@ function UI:ApplyFilter(dataProvider)
 	return changed
 end
 
+-- Re-filters the list that is on screen (no rebuild).
+function UI:RefilterList()
+	local page = ProfessionsFrame and ProfessionsFrame.CraftingPage
+	local list = page and page.RecipeList
+	local scrollBox = list and list.ScrollBox
+	if not scrollBox or type(scrollBox.GetDataProvider) ~= "function" then return false end
+	local dataProvider = scrollBox:GetDataProvider()
+	if not self:ApplyFilter(dataProvider) then return false end
+	-- rows that came back may carry the other comparator if the sort was toggled while they were hidden
+	self:ApplySort(dataProvider)
+	if list.NoResultsText and type(dataProvider.IsEmpty) == "function" then
+		list.NoResultsText:SetShown(dataProvider:IsEmpty())
+	end
+	return true
+end
+
 function UI:SetProfitableOnly(enabled)
 	CP.settings.profitableOnly = enabled and true or false
-	CP.touched.profitableOnly = true
-	-- Rebuild so turning it off restores removed rows (and turning it on starts from a full list).
-	self:RebuildList()
+	CP.touched.profitableOnly = true -- keep the choice if a late-loaded database is adopted
+	if CP.settings.ungroupRecipes then
+		-- the flat list is built from the filtered rows, so it has to be rebuilt
+		self:RebuildFlatList()
+	else
+		self:RefilterList()
+	end
 	CP:Fire("FILTER_CHANGED", CP.settings.profitableOnly)
 end
 
@@ -930,8 +1189,8 @@ local restoringSelection = false
 local function IsProfitableKeep(recipeID)
 	if not CP.settings.profitableOnly then return true end
 	local net = UI:GetNet(recipeID)
-	-- Same rule as ApplyFilter: nil (unknown price) stays; only known losses drop.
-	return net == nil or net >= 0
+	-- Same rule as FilteredOut in the profitable-only filter: only a positive net is kept.
+	return net ~= nil and net > 0
 end
 
 local function CollectRecipeInfos(dataProvider)
@@ -1219,20 +1478,18 @@ function UI:RefreshAll()
 				if node then UI:UpdateRow(frame, node) end
 			end
 		end)
-		-- prices changed: drop newly unprofitable rows, then re-sort with the new numbers
+		-- prices changed: re-filter (hidden rows come back when they no longer lose), then re-sort
 		if type(list.ScrollBox.GetDataProvider) == "function" then
 			local dataProvider = list.ScrollBox:GetDataProvider()
 			if CP.settings.ungroupRecipes then
-				if dataProvider and not ProviderHasCategories(dataProvider) then
-					-- Already flat: update in place so price ticks do not rebuild the whole list.
-					if CP.settings.profitableOnly then self:ApplyFilter(dataProvider) end
-					self:ApplySort(dataProvider)
-				else
+				-- Flat list: with the profit filter on, rebuild so rows that came back into profit reappear.
+				if CP.settings.profitableOnly or not (dataProvider and not ProviderHasCategories(dataProvider)) then
 					self:RebuildFlatList()
+				else
+					self:ApplySort(dataProvider)
 				end
-			else
-				if CP.settings.profitableOnly then self:ApplyFilter(dataProvider) end
-				if CP.settings.sortByProfit then self:ApplySort(dataProvider) end
+			elseif not self:RefilterList() and CP.settings.sortByProfit then
+				self:ApplySort(list.ScrollBox:GetDataProvider())
 			end
 		end
 	end
