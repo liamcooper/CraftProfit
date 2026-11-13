@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix: the addon loads again. Merging 0.5.2 dropped the `end` of `RebuildList`, so `ProfessionUI.lua`
+  failed to parse and nothing in the profession window was drawn.
 - **Missing profitable recipes**: a side tab on the profession window (and `/cf missing`) lists crafts
   you have not learned yet where Auction House net or vendor net is positive. Uses ForeverMaster's
   Forever recipe catalog for trainer and Plans/Pattern recipes of the professions you have. Hover a

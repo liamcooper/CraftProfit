@@ -1004,6 +1004,7 @@ end
 -- one, so state for an older provider is simply forgotten (a weak table would not free it: the nodes point
 -- back at their provider).
 local hiddenFor, hiddenList -- data provider, { { parent, node, index }, ... }
+local rebuildingList = false
 
 -- Rebuild the recipe ScrollBox from Blizzard's grouped tree. page:Init is often a no-op while the
 -- same profession stays open (so Filter toggles did nothing after the first apply); regenerating
@@ -1032,6 +1033,7 @@ function UI:RebuildList()
 	end)
 	rebuildingList = false
 	if not ok then CP:Debug("list rebuild failed: %s", tostring(err)) end
+end
 
 -- Puts every node the filter took out of `dataProvider` back. Returns the nodes that were hidden (a set) or nil.
 local function RestoreHidden(dataProvider)
